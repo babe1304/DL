@@ -1,5 +1,5 @@
 import pandas as pd
-from sklearn.metrics import f1_score, confusion_matrix
+from sklearn.metrics import confusion_matrix
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch import optim
 from tqdm import tqdm
@@ -108,8 +108,7 @@ class Embedding(nn.Module):
                 self.embedding.weight.data[i] = emb[word]
             elif word == '<PAD>':
                 self.embedding.weight.data[i] = torch.zeros(embedding_dim)
-        if path is not None:
-            self.embedding.weight.requires_grad = False
+        self.embedding.freeze = path is not None
 
     def forward(self, x):
         return self.embedding(x)
@@ -138,21 +137,19 @@ def train(model, data, optimizer, criterion, args):
 def evaluate(model, data, criterion, args):
     model.eval()
     with torch.no_grad():
-        acc = 0
-        f1 = 0
         avg_loss = 0
         cf = torch.zeros(2, 2)
         for batch_num, batch in enumerate(data):
             x, y, _ = batch
             logits = model(x).squeeze(1)
             loss = criterion(logits, y.float())
-            acc += ((logits > 0.5) == y).float().mean()
-            f1 += f1_score(logits > 0.5, y, zero_division=1)
             avg_loss += loss.item()
             cf += confusion_matrix(y, logits > 0.5, labels=[0, 1])
         avg_loss /= len(data)
-        acc /= len(data)
-        f1 /= len(data)
+        acc = (cf[0, 0] + cf[1, 1]) / cf.sum()
+        precision = cf[1, 1] / (cf[1, 1] + cf[0, 1])
+        recall = cf[1, 1] / (cf[1, 1] + cf[1, 0])
+        f1 = 2 * (precision * recall) / (precision + recall)
         print(f'Validation loss: {avg_loss}')
         print(f'Validation accuracy: {acc}')
         print(f'Validation F1: {f1}')
@@ -170,7 +167,7 @@ class AveragePool(nn.Module):
         return x
     
 class RNN_Type(nn.Module):
-    def __init__(self, type_, embedding, input_size, hidden_size, num_layers, bidirectional=False, dropout=0):
+    def __init__(self, type_, embedding, input_size, hidden_size, num_layers, bidirectional=False, dropout=0, attention=False):
         super(RNN_Type, self).__init__()
         self.hidden_size = hidden_size
         self.bidirectional = bidirectional
@@ -183,68 +180,95 @@ class RNN_Type(nn.Module):
             self.rnn = nn.GRU(input_size, hidden_size, num_layers, bidirectional=bidirectional, dropout=dropout, batch_first=True)
         else:
             raise ValueError('type must be either rnn, lstm or gru')
-        self.fc_1 = nn.Linear(hidden_size, hidden_size)
+        
+        fc_input_size = hidden_size * (2 if bidirectional else 1)
+        if attention:
+            self.attention = BahdanauAttention(fc_input_size)
+
+        # Define the fully connected layers
+        self.fc_1 = nn.Linear(fc_input_size, hidden_size)
         self.fc_2 = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
         x = self.embedding(x)
-        if isinstance(self.rnn, nn.LSTM):
-            _, (x, _) = self.rnn(x)      
-        else:
-            _, x = self.rnn(x)
+        h_n, _ = self.rnn(x)
         
-        if self.bidirectional:
-            x = (x[-1] + x[-2]) / 2
+        if hasattr(self, 'attention'):
+            h_n = self.attention(h_n)
         else:
-            x = x[-1]
-        x = self.fc_1(x)
+            h_n = h_n[:, -1, :]
+
+        x = self.fc_1(h_n)
         x = F.relu(x)
         x = self.fc_2(x)
         return x
 
+class BahdanauAttention(nn.Module):
+    def __init__(self, hidden_size):
+        super(BahdanauAttention, self).__init__()
+        self.hidden_size = hidden_size
+        self.W = nn.Linear(hidden_size, hidden_size//2)
+        self.v = nn.Linear(hidden_size//2, 1)
+
+    def forward(self, hidden):
+        energy = torch.tanh(self.W(hidden))
+        attention = F.softmax(self.v(energy), dim=1)
+        context = attention * hidden
+        return context.sum(dim=1)
 
 if __name__ == '__main__':
     args = {
         'lr': 1e-4,
-        'epochs': 5,
+        'epochs': 7,
         'clip': 0.25,
         'seed': 7052020,
         'hidden_size': [300],
-        'num_layers': [4],
-        'dropout': [0.2],
-        'bidirectional': [True]
+        'num_layers': [3],
+        'dropout': [0.25],
+        'bidirectional': [True],
+        'vocab_size': -1,
+        'batch_size': 32,
+        'min_freq': 0,
     }
+    attention = False
+    use_embedding = True
+    base = False
+    models_ = ['lstm']
 
-    train_dataset = NLPDataset('data/sst_train_raw.csv')
+    train_dataset = NLPDataset('data/sst_train_raw.csv', max_size=args['vocab_size'])
     val_dataset = NLPDataset('data/sst_valid_raw.csv', vocab=(train_dataset.text_vocab, train_dataset.label_vocab))
     test_dataset = NLPDataset('data/sst_test_raw.csv', vocab=(train_dataset.text_vocab, train_dataset.label_vocab))
 
-    train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True, collate_fn=pad_collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=args['batch_size'], shuffle=True, collate_fn=pad_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
 
-    embedding = Embedding(train_dataset.text_vocab, path='data/sst_glove_6b_300d.txt', embedding_dim=300)
+    if use_embedding:
+        embedding = Embedding(train_dataset.text_vocab, path='data/sst_glove_6b_300d.txt', embedding_dim=300)
+    else:
+        embedding = Embedding(train_dataset.text_vocab, embedding_dim=300)
 
     np.random.seed(args['seed'])
     torch.manual_seed(args['seed'])
 
-    print('Baseline model:')
-    model = nn.Sequential(
-            embedding,
-            AveragePool(),
-            nn.Linear(300, 150),
-            nn.ReLU(),
-            nn.Linear(150, 150),
-            nn.ReLU(),
-            nn.Linear(150, 1)
-        )
-    loss = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args['lr'])
-    for epoch in range(args['epochs']):
-        train(model, train_loader, optimizer, loss, args)
-        evaluate(model, val_loader, loss, args)
-    print('\nTest results for baseline model:')
-    base_avg_loss, base_acc, base_f1 = evaluate(model, test_loader, loss, args)
+    if base:
+        print('Baseline model:')
+        model = nn.Sequential(
+                embedding,
+                AveragePool(),
+                nn.Linear(300, 150),
+                nn.ReLU(),
+                nn.Linear(150, 150),
+                nn.ReLU(),
+                nn.Linear(150, 1)
+            )
+        loss = nn.BCEWithLogitsLoss()
+        optimizer = optim.Adam(model.parameters(), lr=args['lr'])
+        for epoch in range(args['epochs']):
+            train(model, train_loader, optimizer, loss, args)
+            evaluate(model, val_loader, loss, args)
+        print('\nTest results for baseline model:')
+        base_avg_loss, base_acc, base_f1 = evaluate(model, test_loader, loss, args)
 
     best = {
         'f1': {'lstm': [0, None], 'gru': [0, None], 'rnn': [0, None]},
@@ -255,11 +279,10 @@ if __name__ == '__main__':
     combinations = list(product(args['hidden_size'], args['num_layers'], args['dropout'], args['bidirectional']))
     for  i,comb in enumerate(combinations):
         args['hidden_size'], args['num_layers'], args['dropout'], args['bidirectional'] = comb
-        print(f'\n {i}/{len(combinations)} args: {args}')
+        print(f'\n {i + 1}/{len(combinations)} args: {args}')
 
-        for type_ in ['lstm', 'gru', 'rnn']: 
-
-            model = RNN_Type(type_, embedding, 300, args['hidden_size'], args['num_layers'], args['bidirectional'], args['dropout'])
+        for type_ in models_: 
+            model = RNN_Type(type_, embedding, 300, args['hidden_size'], args['num_layers'], args['bidirectional'], args['dropout'], attention)
 
             loss_fn = nn.BCEWithLogitsLoss()
             optimizer = optim.Adam(model.parameters(), lr=args['lr'])
@@ -277,10 +300,11 @@ if __name__ == '__main__':
                 best['loss'][type_] = [loss, args]
             print('\n')
 
-    print('Baseline results:')
-    print('F1:', base_f1)
-    print('Accuracy:', base_acc)
-    print('Loss:', base_avg_loss)
+    if base:
+        print('Baseline results:')
+        print('F1:', base_f1)
+        print('Accuracy:', base_acc)
+        print('Loss:', base_avg_loss)
     print('\nBest results:')
     print('F1:')
     print(best['f1'])
